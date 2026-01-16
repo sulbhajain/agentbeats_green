@@ -24,22 +24,24 @@ def main():
     # See: https://a2a-protocol.org/latest/tutorials/python/3-agent-skills-and-card/
     
     skill = AgentSkill(
-        id="",
-        name="",
-        description="",
-        tags=[],
-        examples=[]
+        id="tau2_evaluation",
+        name="Tau2 Benchmark Evaluation",
+        description="Evaluates agents on tau-bench tasks (airline, retail, etc).",
+        tags=["benchmark", "evaluation", "tau2"],
+        examples=[
+            '{"participants": {"agent": "http://localhost:9019"}, "config": {"domain": "airline", "num_tasks": 5}}'
+        ],
     )
 
     agent_card = AgentCard(
-        name="",
-        description="",
+        name="Tau2 Evaluator for partial credits",
+        description="Tau2 benchmark evaluator - test agents for partial credits.",
         url=args.card_url or f"http://{args.host}:{args.port}/",
-        version='1.0.0',
-        default_input_modes=['text'],
-        default_output_modes=['text'],
+        version="1.0.0",
+        default_input_modes=["text"],
+        default_output_modes=["text"],
         capabilities=AgentCapabilities(streaming=True),
-        skills=[skill]
+        skills=[skill],
     )
 
     request_handler = DefaultRequestHandler(

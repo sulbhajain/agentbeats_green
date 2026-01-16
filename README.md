@@ -36,12 +36,17 @@ For a concrete example of implementing a green agent using this template, see th
 ```bash
 # Install dependencies
 uv sync
+uv sync --extra tau2-evaluator
 
 # Run the server
 uv run src/server.py
 ```
 
 ## Running with Docker
+
+> **Note:** Docker is optional for local development. Use the local setup above for development and testing.
+
+First, ensure [Docker](https://www.docker.com/products/docker-desktop) is installed:
 
 ```bash
 # Build the image
