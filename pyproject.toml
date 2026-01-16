@@ -12,6 +12,7 @@ dependencies = [
 
 [project.optional-dependencies]
 tau2-evaluator = [
+    "nest-asyncio>=1.6.0",
     "tau2 @ git+https://github.com/sierra-research/tau2-bench.git",
 ]
 test = [
@@ -19,3 +20,6 @@ test = [
     "pytest-asyncio>=0.24.0",
     "httpx>=0.28.1",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

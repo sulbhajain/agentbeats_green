@@ -5,6 +5,7 @@ import time
 import uuid
 from typing import Any
 
+import nest_asyncio
 from pydantic import BaseModel, HttpUrl, ValidationError
 
 from a2a.server.tasks import TaskUpdater
@@ -13,45 +14,173 @@ from a2a.utils import get_message_text, new_agent_text_message
 
 from messenger import Messenger
 
-import asyncio
-import json
-import logging
-import time
-import uuid
-from typing import Any
-
-
-from pydantic import BaseModel, HttpUrl, ValidationError
-
-from a2a.server.tasks import TaskUpdater
-from a2a.types import DataPart, Message, Part, TaskState, TextPart
-from a2a.utils import get_message_text, new_agent_text_message
-
-from messenger import Messenger
-
-
+from tau2.agent.base import BaseAgent, ValidAgentInputMessage
+from tau2.agent.llm_agent import LLMAgentState
 from tau2.data_model.message import (
     AssistantMessage,
+    MultiToolMessage,
+    SystemMessage,
     ToolCall,
+    ToolMessage,
     UserMessage,
 )
-
 from tau2.data_model.simulation import ActionCheck, RewardInfo
-from tau2.data_model.tasks import  RewardType
-
-
+from tau2.data_model.tasks import Action, RewardType, Task
+from tau2.environment.tool import Tool
+from tau2.evaluator.evaluator import EvaluationType, evaluate_simulation
 from tau2.orchestrator.orchestrator import Orchestrator
 from tau2.registry import registry
+from tau2.run import get_tasks
 from tau2.user.user_simulator import UserSimulator
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("agent")
+
+nest_asyncio.apply()
+RESPOND_ACTION_NAME = "respond"
+
+def tools_to_str(tools: list[Tool]) -> str:
+    return json.dumps([tool.openai_schema for tool in tools], indent=2)
+
+def extract_text_from_message(message: MultiToolMessage | UserMessage | ToolMessage) -> str:
+    if isinstance(message, UserMessage):
+        return message.content
+    if isinstance(message, MultiToolMessage):
+        tool_results = [f"Tool '{tm.name}' result: {tm.content}" for tm in message.tool_messages]
+        return "\n".join(tool_results)
+    return str(message.content)
 
 class EvalRequest(BaseModel):
     """Request format sent by the AgentBeats platform to green agents."""
     participants: dict[str, HttpUrl] # role -> agent URL
     config: dict[str, Any]
 
+class RemoteA2AAgent(BaseAgent):
+    def __init__(
+        self,
+        *,
+        tools: list[Tool],
+        domain_policy: str,
+        messenger: Messenger,
+        agent_url: str,
+    ):
+        self.tools = tools
+        self.domain_policy = domain_policy
+        self.messenger = messenger
+        self.agent_url = agent_url
+        self._is_first_message = True
+
+    @property
+    def agent_prompt(self) -> str:
+        return f"""{self.domain_policy}
+
+Here's a list of tools you can use (you can use at most one tool at a time):
+{tools_to_str(self.tools)}
+
+and
+
+{json.dumps({
+    "type": "function",
+    "function": {
+        "name": RESPOND_ACTION_NAME,
+        "description": "Respond directly to the user with a message instead of calling a tool.",
+        "parameters": {
+            "properties": {
+                "content": {
+                    "description": "The message content to send to the user.",
+                    "title": "Content",
+                    "type": "string"
+                }
+            },
+            "required": ["content"],
+            "title": "parameters",
+            "type": "object"
+        }
+    }
+}, indent=2)}
+
+Please respond in JSON format.
+The JSON should contain:
+- \"name\": the tool call function name.
+- \"arguments\": the arguments for the tool call.
+
+You should only use one tool at a time.
+"""
+
+    def get_init_state(self, message_history: list | None = None) -> LLMAgentState:
+        self._is_first_message = True
+        return LLMAgentState(
+            system_messages=[SystemMessage(role="system", content=self.agent_prompt)],
+            messages=message_history or [],
+        )
+
+    def set_seed(self, seed: int):
+        return None
+
+    def stop(self, last_message=None, state=None):
+        return None
+
+    def generate_next_message(
+        self, message: ValidAgentInputMessage, state: LLMAgentState
+    ) -> tuple[AssistantMessage, LLMAgentState]:
+        if isinstance(message, MultiToolMessage):
+            state.messages.extend(message.tool_messages)
+        else:
+            state.messages.append(message)
+
+        outgoing_text = extract_text_from_message(message)
+        if self._is_first_message:
+            user_msgs = "\n".join(extract_text_from_message(m) for m in state.messages)
+            outgoing_text = f"{self.agent_prompt}\n\nNow here are the user messages:\n{user_msgs}"
+
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        response = loop.run_until_complete(
+            self.messenger.talk_to_agent(
+                message=outgoing_text,
+                url=self.agent_url,
+                new_conversation=self._is_first_message,
+            )
+        )
+        self._is_first_message = False
+
+        assistant_message = self._parse_response(response)
+        state.messages.append(assistant_message)
+        return assistant_message, state
+
+    def _parse_response(self, response: str) -> AssistantMessage:
+        try:
+            action_dict = json.loads(response)
+            is_tool_call = action_dict["name"] != RESPOND_ACTION_NAME
+
+            if not is_tool_call:
+                return AssistantMessage(
+                    role="assistant",
+                    content=action_dict["arguments"]["content"],
+                    tool_calls=None,
+                )
+
+            tool_call = ToolCall(
+                id=f"call_{uuid.uuid4().hex[:8]}",
+                name=action_dict["name"],
+                arguments=action_dict["arguments"],
+                requestor="assistant",
+            )
+            return AssistantMessage(
+                role="assistant",
+                content=None,
+                tool_calls=[tool_call],
+            )
+        except Exception:
+            return AssistantMessage(
+                role="assistant",
+                content=response,
+                tool_calls=None,
+            )
 
 class Agent:
     # Fill in: list of required participant roles, e.g. ["pro_debater", "con_debater"]
@@ -134,7 +263,7 @@ class Agent:
 
         agent_url = str(request.participants["agent"])
 
-        tasks = get_task_objects(domain, task_ids, num_tasks)
+        tasks = self.get_task_objects(domain, task_ids, num_tasks)
         logger.info(f"Running {len(tasks)} tasks for domain {domain}")
 
         await updater.update_status(
@@ -358,4 +487,18 @@ Task Results:
             return [True, 1.0]
         else:
             return [True, 0.5]
-        return [False, 0.0]
+    
+    def get_task_objects(self, domain: str, task_ids: list[str] | None, num_tasks: int | None):
+        task_set_name = domain
+        task_split_name = "base"
+        if task_ids is None:
+            tasks = get_tasks(task_set_name=task_set_name, task_split_name=task_split_name)
+        else:
+            tasks = get_tasks(
+                task_set_name=task_set_name,
+                task_split_name=task_split_name,
+                task_ids=task_ids,
+            )
+        if num_tasks is not None:
+            tasks = tasks[:num_tasks]
+        return tasks
